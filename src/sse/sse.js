@@ -77,6 +77,13 @@ This extension adds support for Server Sent Events to htmx.  See /www/extensions
       if (!htmx.config.sseReconnectDelay) {
         htmx.config.sseReconnectDelay = 'exponential'
       }
+
+      // Default transport: the browser's own EventSource. 'fetch' selects
+      // FetchEventSource, which is also exposed for a page's own createEventSource.
+      if (!htmx.config.sseTransport) {
+        htmx.config.sseTransport = 'eventsource'
+      }
+      htmx.FetchEventSource = FetchEventSource
     },
 
     getSelectors: function() {
@@ -122,10 +129,19 @@ This extension adds support for Server Sent Events to htmx.  See /www/extensions
    * It is installed as htmx.createEventSource, which a page can replace with its own
    * function before or after this extension is loaded.
    *
+   * htmx.config.sseTransport picks the implementation: 'eventsource' (the default) is
+   * the browser's EventSource, 'fetch' is FetchEventSource.
+   *
    * @param {string} url
    * @returns EventSource
    */
   function createEventSource(url) {
+    if (htmx.config.sseTransport === 'fetch') {
+      return new FetchEventSource(url, { withCredentials: true })
+    }
+    if (htmx.config.sseTransport !== 'eventsource') {
+      logError('htmx.config.sseTransport must be "eventsource" or "fetch"; using "eventsource"')
+    }
     return new EventSource(url, { withCredentials: true })
   }
 
@@ -284,7 +300,7 @@ This extension adds support for Server Sent Events to htmx.  See /www/extensions
     var replacedSource = state.hadSource
     state.hadSource = true
 
-    var source = htmx.createEventSource(url)
+    var source = (htmx.createEventSource || createEventSource)(url)
 
     source.onerror = function(err) {
       state.attempt++
@@ -580,6 +596,436 @@ This extension adds support for Server Sent Events to htmx.  See /www/extensions
   function logError(msg) {
     if (console.error) {
       console.error(msg)
+    }
+  }
+
+  /// ////////////////////////////////////////////
+  // FETCH TRANSPORT
+  /// ////////////////////////////////////////////
+
+  var CONNECTING = 0
+  var OPEN = 1
+  var CLOSED = 2
+
+  // How long to wait for the browser to report it is online again before trying
+  // anyway: navigator.onLine is not reliable everywhere, in-app browsers especially.
+  var OFFLINE_WAIT_CAP = 60000
+
+  /**
+   * FetchEventSource is an EventSource that reads the stream with fetch().
+   *
+   * It follows the processing model of the EventSource specification
+   * (https://html.spec.whatwg.org/multipage/server-sent-events.html) and has the
+   * same interface, with one addition: every `error` event carries a `failure`
+   * property that says why the connection failed.
+   *
+   * - {kind: 'http', status, headers, url, redirected}: the server answered with a
+   *   status other than 200. Like EventSource, the connection is failed: readyState
+   *   becomes CLOSED and nothing reconnects it.
+   * - {kind: 'content-type', status, headers, url, redirected}: a 200 response that
+   *   is not text/event-stream, for example an HTML page served in its place. Failed
+   *   like the above.
+   * - {kind: 'network', status: null}: the request or the stream failed without a
+   *   response. Like EventSource, readyState becomes CONNECTING and the connection is
+   *   reestablished after the reconnection time (3s, or what the stream set with a
+   *   `retry:` field).
+   * - {kind: 'ended', status: null}: the server ended the stream. Reestablished like
+   *   a network failure, as the specification requires.
+   *
+   * This is the only thing EventSource cannot do: the specification hands its error
+   * event no status and no headers, so a page cannot tell an expired session from a
+   * proxy's challenge page from a server that is restarting. Cross-origin, only the
+   * headers the server exposes through CORS are readable, as with any fetch().
+   *
+   * Differences that are not about failures:
+   *
+   * - The stream is closed on pagehide and reopened on a pageshow that restores the
+   *   page from the back/forward cache, without an error event in between. An open
+   *   fetch() keeps a page out of that cache in some browsers, where an EventSource
+   *   does not.
+   * - While navigator.onLine is false, a reconnect waits for the `online` event, for
+   *   at most 60s.
+   *
+   * Needs fetch() with a readable body, AbortController and a constructible
+   * EventTarget: Chrome 64, Firefox 65, Safari 14.
+   *
+   * @param {string} url
+   * @param {{withCredentials?: boolean}} [options]
+   */
+  function FetchEventSource(url, options) {
+    var self = this
+    var target = new EventTarget()
+    var controller = null
+    var reconnectTimer = null
+    var onlineListener = null
+    var suspended = false
+    var reconnectionTime = 3000
+    var lastEventId = ''
+    var origin = ''
+
+    try {
+      this.url = new URL(url, document.baseURI).href
+    } catch (e) {
+      throw new DOMException('Invalid URL: ' + url, 'SyntaxError')
+    }
+    this.withCredentials = !!(options && options.withCredentials)
+    this.readyState = CONNECTING
+    this.onopen = null
+    this.onmessage = null
+    this.onerror = null
+
+    this.addEventListener = function(type, listener, opts) {
+      target.addEventListener(type, listener, opts)
+    }
+    this.removeEventListener = function(type, listener, opts) {
+      target.removeEventListener(type, listener, opts)
+    }
+    this.dispatchEvent = function(event) {
+      var handler = self['on' + event.type]
+      if (typeof handler === 'function') {
+        try {
+          handler.call(self, event)
+        } catch (e) {
+          reportError(e)
+        }
+      }
+      return target.dispatchEvent(event)
+    }
+
+    this.close = function() {
+      self.readyState = CLOSED
+      stopWaiting()
+      abortFetch()
+      window.removeEventListener('pagehide', onPageHide)
+      window.removeEventListener('pageshow', onPageShow)
+    }
+
+    window.addEventListener('pagehide', onPageHide)
+    window.addEventListener('pageshow', onPageShow)
+    connect()
+
+    function connect() {
+      stopWaiting()
+      controller = new AbortController()
+      var signal = controller.signal
+      var headers = { Accept: 'text/event-stream' }
+      if (lastEventId !== '') {
+        headers['Last-Event-ID'] = lastEventId
+      }
+
+      fetch(self.url, {
+        headers: headers,
+        cache: 'no-store',
+        credentials: self.withCredentials ? 'include' : 'same-origin',
+        mode: 'cors',
+        redirect: 'follow',
+        signal: signal
+      }).then(function(response) {
+        if (signal.aborted) {
+          cancelBody(response)
+          return
+        }
+        if (response.status !== 200 || !isEventStream(response.headers.get('Content-Type'))) {
+          cancelBody(response)
+          failConnection({
+            kind: response.status !== 200 ? 'http' : 'content-type',
+            status: response.status,
+            headers: response.headers,
+            url: response.url,
+            redirected: response.redirected
+          })
+          return
+        }
+        if (!response.body) {
+          reestablish({ kind: 'network', status: null })
+          return
+        }
+        origin = originOf(response.url || self.url)
+        self.readyState = OPEN
+        self.dispatchEvent(new Event('open'))
+        return read(response.body.getReader(), signal)
+      }, function() {
+        if (!signal.aborted) {
+          reestablish({ kind: 'network', status: null })
+        }
+      })
+    }
+
+    function read(reader, signal) {
+      var decoder = new TextDecoder('utf-8')
+      var parser = createParser(function(type, data, id) {
+        lastEventId = id
+        if (type === null || self.readyState === CLOSED || signal.aborted) {
+          return
+        }
+        self.dispatchEvent(new MessageEvent(type, { data: data, origin: origin, lastEventId: lastEventId }))
+      }, function(ms) {
+        reconnectionTime = ms
+      }, function() {
+        return self.readyState === CLOSED || signal.aborted
+      })
+
+      function pump() {
+        return reader.read().then(function(result) {
+          if (signal.aborted) {
+            return
+          }
+          if (result.done) {
+            parser.end()
+            reestablish({ kind: 'ended', status: null })
+            return
+          }
+          parser.feed(decoder.decode(result.value, { stream: true }))
+          if (self.readyState === CLOSED || signal.aborted) {
+            reader.cancel().catch(function() {})
+            return
+          }
+          return pump()
+        }, function() {
+          if (!signal.aborted) {
+            reestablish({ kind: 'network', status: null })
+          }
+        })
+      }
+      return pump()
+    }
+
+    // "Fail the connection": CLOSED first, then the error event, and nothing reconnects.
+    function failConnection(failure) {
+      if (self.readyState === CLOSED) {
+        return
+      }
+      self.readyState = CLOSED
+      abortFetch()
+      fireError(failure)
+    }
+
+    // "Reestablish the connection": CONNECTING first, then the error event, then wait
+    // the reconnection time and connect again, unless the connection was closed in
+    // the meantime.
+    function reestablish(failure) {
+      if (self.readyState === CLOSED) {
+        return
+      }
+      abortFetch()
+      self.readyState = CONNECTING
+      fireError(failure)
+      if (self.readyState !== CONNECTING) {
+        return
+      }
+      stopWaiting()
+      if (navigator.onLine === false) {
+        onlineListener = function() {
+          stopWaiting()
+          reconnectTimer = window.setTimeout(retry, reconnectionTime)
+        }
+        window.addEventListener('online', onlineListener)
+        reconnectTimer = window.setTimeout(retry, Math.max(reconnectionTime, OFFLINE_WAIT_CAP))
+      } else {
+        reconnectTimer = window.setTimeout(retry, reconnectionTime)
+      }
+    }
+
+    function retry() {
+      reconnectTimer = null
+      if (self.readyState === CONNECTING && !suspended) {
+        connect()
+      }
+    }
+
+    function fireError(failure) {
+      var event = new Event('error')
+      event.failure = failure
+      self.dispatchEvent(event)
+    }
+
+    function stopWaiting() {
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer)
+        reconnectTimer = null
+      }
+      if (onlineListener !== null) {
+        window.removeEventListener('online', onlineListener)
+        onlineListener = null
+      }
+    }
+
+    function abortFetch() {
+      if (controller !== null) {
+        controller.abort()
+        controller = null
+      }
+    }
+
+    function onPageHide() {
+      if (self.readyState === CLOSED) {
+        return
+      }
+      suspended = true
+      stopWaiting()
+      abortFetch()
+      self.readyState = CONNECTING
+    }
+
+    function onPageShow(event) {
+      if (!suspended || self.readyState === CLOSED) {
+        return
+      }
+      if (event.persisted) {
+        suspended = false
+        connect()
+      }
+    }
+  }
+
+  FetchEventSource.CONNECTING = FetchEventSource.prototype.CONNECTING = CONNECTING
+  FetchEventSource.OPEN = FetchEventSource.prototype.OPEN = OPEN
+  FetchEventSource.CLOSED = FetchEventSource.prototype.CLOSED = CLOSED
+
+  /**
+   * createParser returns an event stream parser, as specified in "Interpreting an
+   * event stream". Text is fed as it is decoded; a line ending may be split across
+   * two chunks (CR at the end of one, LF at the start of the next).
+   *
+   * onEvent(type, data, id) is called at every empty line: type is null when there is
+   * nothing to dispatch (empty data), and id is the last event ID buffer, which the
+   * source's last event ID is set to either way. The buffer belongs to the stream:
+   * it starts empty on every connection and is not reset between events.
+   *
+   * isStopped() is asked after every line, so that a listener closing the source
+   * stops the rest of the chunk from being dispatched.
+   *
+   * @param {function(string|null, string, string|null)} onEvent
+   * @param {function(number)} onRetry
+   * @param {function(): boolean} isStopped
+   */
+  function createParser(onEvent, onRetry, isStopped) {
+    var line = ''
+    var pendingCR = false
+    var data = ''
+    var eventType = ''
+    var idBuffer = ''
+
+    function feed(text) {
+      var pos = 0
+      if (pendingCR && text.charAt(0) === '\n') {
+        pos = 1
+      }
+      pendingCR = false
+      while (pos < text.length) {
+        var cr = text.indexOf('\r', pos)
+        var lf = text.indexOf('\n', pos)
+        var end = cr === -1 ? lf : (lf === -1 ? cr : Math.min(cr, lf))
+        if (end === -1) {
+          line += text.slice(pos)
+          return
+        }
+        line += text.slice(pos, end)
+        processLine(line)
+        line = ''
+        if (text.charAt(end) === '\r') {
+          if (end + 1 === text.length) {
+            pendingCR = true
+          } else if (text.charAt(end + 1) === '\n') {
+            end++
+          }
+        }
+        pos = end + 1
+        if (isStopped()) {
+          return
+        }
+      }
+    }
+
+    function processLine(l) {
+      if (l === '') {
+        dispatch()
+        return
+      }
+      if (l.charAt(0) === ':') {
+        return
+      }
+      var colon = l.indexOf(':')
+      var field = l
+      var value = ''
+      if (colon !== -1) {
+        field = l.slice(0, colon)
+        value = l.slice(colon + 1)
+        if (value.charAt(0) === ' ') {
+          value = value.slice(1)
+        }
+      }
+      if (field === 'event') {
+        eventType = value
+      } else if (field === 'data') {
+        data += value + '\n'
+      } else if (field === 'id') {
+        if (value.indexOf('\u0000') === -1) {
+          idBuffer = value
+        }
+      } else if (field === 'retry') {
+        if (/^[0-9]+$/.test(value)) {
+          onRetry(parseInt(value, 10))
+        }
+      }
+    }
+
+    function dispatch() {
+      if (data === '') {
+        eventType = ''
+        onEvent(null, '', idBuffer)
+        return
+      }
+      var d = data.charAt(data.length - 1) === '\n' ? data.slice(0, -1) : data
+      var type = eventType === '' ? 'message' : eventType
+      data = ''
+      eventType = ''
+      onEvent(type, d, idBuffer)
+    }
+
+    // End of the stream: an event that did not end with an empty line is discarded.
+    function end() {
+      line = ''
+      pendingCR = false
+      data = ''
+      eventType = ''
+    }
+
+    return { feed: feed, end: end }
+  }
+
+  /**
+   * isEventStream checks that a Content-Type header's MIME type essence is
+   * text/event-stream, ignoring case and parameters such as charset.
+   *
+   * @param {string|null} contentType
+   */
+  function isEventStream(contentType) {
+    if (!contentType) {
+      return false
+    }
+    return contentType.split(';')[0].trim().toLowerCase() === 'text/event-stream'
+  }
+
+  function cancelBody(response) {
+    if (response.body) {
+      response.body.cancel().catch(function() {})
+    }
+  }
+
+  function originOf(url) {
+    try {
+      return new URL(url).origin
+    } catch (e) {
+      return ''
+    }
+  }
+
+  function reportError(e) {
+    if (typeof window.reportError === 'function') {
+      window.reportError(e)
+    } else {
+      window.setTimeout(function() { throw e })
     }
   }
 })()
