@@ -79,6 +79,7 @@ describe('sse extension', function() {
     this.server.restore()
     this.clock.restore();
     clearWorkArea()
+    htmx.config.sseReconnectDelay = 'exponential'
   })
 
   it('correctly subscribes to events', function() {
@@ -945,5 +946,257 @@ describe('sse extension', function() {
     inner.sendEvent('e1', 'Event 1')
     messageCount.should.equal(1)
     byId('d1').innerHTML.should.equal('Event 1')
+  })
+
+  describe('reconnect control', function() {
+    it('stops reconnecting when a listener cancels htmx:sseError', function() {
+      var div = make('<div hx-ext="sse" sse-connect="/foo"><div id="d1" sse-swap="e1">init</div></div>')
+      this.clock.tick(1)
+      var closeTypes = []
+      div.addEventListener('htmx:sseError', function(evt) { evt.preventDefault() })
+      div.addEventListener('htmx:sseClose', function(evt) { closeTypes.push(evt.detail.type) })
+
+      this.eventSource.simulateConnectionError()
+      this.clock.tick(200000)
+
+      this.eventSources.should.be.lengthOf(1)
+      closeTypes.should.deep.equal(['stopped'])
+    })
+
+    it('closes a CONNECTING source when the error is cancelled, ending the browser\'s own reconnect', function() {
+      var div = make('<div hx-ext="sse" sse-connect="/foo"></div>')
+      this.clock.tick(1)
+      div.addEventListener('htmx:sseError', function(evt) { evt.preventDefault() })
+
+      var source = this.eventSource
+      source.readyState = EventSource.CONNECTING
+      source.onerror()
+
+      source.readyState.should.equal(EventSource.CLOSED)
+      this.clock.tick(200000)
+      this.eventSources.should.be.lengthOf(1)
+    })
+
+    it('describes the failure and counts consecutive attempts', function() {
+      var div = make('<div hx-ext="sse" sse-connect="/foo"></div>')
+      this.clock.tick(1)
+      var seen = []
+      div.addEventListener('htmx:sseError', function(evt) {
+        seen.push([evt.detail.attempt, evt.detail.failure.kind, evt.detail.failure.status])
+      })
+
+      this.eventSource.simulateConnectionError() // attempt 1, retry after 500ms
+      this.clock.tick(500)
+      this.eventSource.simulateConnectionError() // the retry fails before it opens: attempt 2
+      this.clock.tick(1000)
+      this.clock.tick(1) // this one opens, which resets the count
+      this.eventSource.simulateConnectionError()
+
+      seen.should.deep.equal([[1, 'refused', null], [2, 'refused', null], [1, 'refused', null]])
+    })
+
+    it('reports a CONNECTING error as a network failure', function() {
+      var div = make('<div hx-ext="sse" sse-connect="/foo"></div>')
+      this.clock.tick(1)
+      var kind = null
+      div.addEventListener('htmx:sseError', function(evt) { kind = evt.detail.failure.kind })
+
+      this.eventSource.readyState = EventSource.CONNECTING
+      this.eventSource.onerror()
+
+      kind.should.equal('network')
+      this.clock.tick(200000)
+      this.eventSources.should.be.lengthOf(1) // the browser reconnects a CONNECTING source by itself
+    })
+
+    it('passes on a failure the transport describes itself', function() {
+      var div = make('<div hx-ext="sse" sse-connect="/foo"></div>')
+      this.clock.tick(1)
+      var failure = null
+      div.addEventListener('htmx:sseError', function(evt) { failure = evt.detail.failure })
+
+      this.eventSource.close()
+      this.eventSource.onerror({ failure: { kind: 'http', status: 401 } })
+
+      failure.should.deep.equal({ kind: 'http', status: 401 })
+    })
+
+    it('reconnects now on htmx:sseReconnect, from a descendant, and rebinds the children', function() {
+      make('<div hx-ext="sse" sse-connect="/foo"><div id="d1" sse-swap="e1">init</div></div>')
+      this.clock.tick(1)
+      var first = this.eventSource
+      var closeType = null
+      first.close = function() { this.readyState = EventSource.CLOSED }
+      byId('d1').parentElement.addEventListener('htmx:sseClose', function(evt) { closeType = evt.detail.type })
+
+      htmx.trigger(byId('d1'), 'htmx:sseReconnect')
+      this.clock.tick(1)
+
+      first.readyState.should.equal(EventSource.CLOSED)
+      closeType.should.equal('reconnect')
+      this.eventSources.should.be.lengthOf(2)
+      this.eventSource._listeners.e1.should.be.lengthOf(1)
+      this.eventSource.sendEvent('e1', 'Event 1')
+      byId('d1').innerHTML.should.equal('Event 1')
+    })
+
+    it('reopens a stopped connection on htmx:sseReconnect', function() {
+      var div = make('<div hx-ext="sse" sse-connect="/foo"></div>')
+      this.clock.tick(1)
+      var cancel = function(evt) { evt.preventDefault() }
+      div.addEventListener('htmx:sseError', cancel)
+      this.eventSource.simulateConnectionError()
+      div.removeEventListener('htmx:sseError', cancel)
+
+      htmx.trigger(div, 'htmx:sseReconnect')
+      this.clock.tick(1)
+
+      this.eventSources.should.be.lengthOf(2)
+      this.eventSource.readyState.should.equal(EventSource.OPEN)
+    })
+
+    it('does nothing when a listener cancels htmx:sseReconnect', function() {
+      var div = make('<div hx-ext="sse" sse-connect="/foo"></div>')
+      this.clock.tick(1)
+      div.addEventListener('htmx:sseReconnect', function(evt) { evt.preventDefault() })
+
+      htmx.trigger(div, 'htmx:sseReconnect')
+      this.clock.tick(1)
+
+      this.eventSources.should.be.lengthOf(1)
+      this.eventSource.readyState.should.equal(EventSource.OPEN)
+    })
+
+    it('keeps one reconnect chain when a reconnect is requested while one is pending', function() {
+      var div = make('<div hx-ext="sse" sse-connect="/foo"></div>')
+      this.clock.tick(1)
+      htmx.config.sseReconnectDelay = function() { return 5000 }
+
+      this.eventSource.simulateConnectionError() // a retry is now pending for 5s
+      htmx.trigger(div, 'htmx:sseReconnect') // opens one right away
+      this.clock.tick(1)
+      this.eventSource.simulateConnectionError() // which fails too: one new pending retry
+      this.clock.tick(20000)
+
+      // initial, the requested reconnect, and ONE retry after it failed. The retry
+      // that was pending when the reconnect was requested must not fire as well.
+      this.eventSources.should.be.lengthOf(3)
+    })
+
+    it('cancels a pending reconnect when the element is cleaned up', function() {
+      var div = make('<div hx-ext="sse" sse-connect="/foo"></div>')
+      this.clock.tick(1)
+
+      this.eventSource.simulateConnectionError()
+      htmx.trigger(div, 'htmx:beforeCleanupElement')
+      this.clock.tick(200000)
+
+      this.eventSources.should.be.lengthOf(1)
+    })
+
+    it('does not reopen a stream for an element that left the document while it waited', function() {
+      var div = make('<div hx-ext="sse" sse-connect="/foo"></div>')
+      this.clock.tick(1)
+
+      this.eventSource.simulateConnectionError()
+      div.remove()
+      this.clock.tick(200000)
+
+      this.eventSources.should.be.lengthOf(1)
+    })
+
+    it('uses the delay a sseReconnectDelay function returns, with the attempt and failure', function() {
+      var div = make('<div hx-ext="sse" sse-connect="/foo"></div>')
+      this.clock.tick(1)
+      var args = null
+      htmx.config.sseReconnectDelay = function(attempt, failure) {
+        args = [attempt, failure.kind]
+        return 1234
+      }
+
+      this.eventSource.simulateConnectionError()
+      this.clock.tick(1233)
+      this.eventSources.should.be.lengthOf(1)
+      this.clock.tick(1)
+      this.eventSources.should.be.lengthOf(2)
+      args.should.deep.equal([1, 'refused'])
+    })
+
+    it('falls back to the default delay when a sseReconnectDelay function returns no delay', function() {
+      make('<div hx-ext="sse" sse-connect="/foo"></div>')
+      this.clock.tick(1)
+      htmx.config.sseReconnectDelay = function() { return undefined }
+      var logged = sinon.stub(console, 'error')
+
+      try {
+        this.eventSource.simulateConnectionError()
+        this.clock.tick(499)
+        this.eventSources.should.be.lengthOf(1)
+        this.clock.tick(1)
+        this.eventSources.should.be.lengthOf(2)
+        logged.called.should.equal(true)
+      } finally {
+        logged.restore()
+      }
+    })
+
+    it('spreads a full-jitter delay below the exponential ceiling', function() {
+      make('<div hx-ext="sse" sse-connect="/foo"></div>')
+      this.clock.tick(1)
+      htmx.config.sseReconnectDelay = 'full-jitter'
+      var random = sinon.stub(Math, 'random').returns(0.5)
+
+      try {
+        this.eventSource.simulateConnectionError() // attempt 1: 0.5 * 500
+        this.clock.tick(249)
+        this.eventSources.should.be.lengthOf(1)
+        this.clock.tick(1)
+        this.eventSources.should.be.lengthOf(2)
+
+        // Let the retry open, so the next failure is attempt 1 again, not 2
+        this.clock.tick(1)
+        this.eventSource.simulateConnectionError()
+        this.clock.tick(249)
+        this.eventSources.should.be.lengthOf(2)
+        this.clock.tick(1)
+        this.eventSources.should.be.lengthOf(3)
+      } finally {
+        random.restore()
+      }
+    })
+
+    it('grows the full-jitter ceiling with consecutive failures', function() {
+      make('<div hx-ext="sse" sse-connect="/foo"></div>')
+      this.clock.tick(1)
+      htmx.config.sseReconnectDelay = 'full-jitter'
+      var delays = []
+      var random = sinon.stub(Math, 'random').returns(0.5)
+      var test = this
+      // every retry fails before it can open
+      var create = htmx.createEventSource
+      htmx.createEventSource = function(url) {
+        var es = create(url)
+        es.failConnections = true
+        return es
+      }
+
+      try {
+        this.eventSource.simulateConnectionError()
+        for (var i = 0; i < 9; i++) {
+          var before = test.eventSources.length
+          var waited = 0
+          while (test.eventSources.length === before) {
+            test.clock.tick(1)
+            waited++
+          }
+          delays.push(waited)
+        }
+        // 0.5 * 500 * 2^(attempt-1), capped at attempt 8 (64s ceiling). Every wait
+        // after the first also includes the 1ms the mock takes to fail a connect.
+        delays.should.deep.equal([250, 501, 1001, 2001, 4001, 8001, 16001, 32001, 32001])
+      } finally {
+        random.restore()
+      }
+    })
   })
 })

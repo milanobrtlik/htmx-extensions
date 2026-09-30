@@ -34,6 +34,27 @@ This extension adds support for Server Sent Events to htmx.  See /www/extensions
    */
   var sseListeners = new WeakMap()
 
+  /**
+   * sseStates keeps the reconnect state of every element that owns a connection:
+   *
+   * - timer: the pending reconnect, so that it can be cancelled. An untracked timer
+   *   survives a reconnect requested in the meantime, and whichever of the two
+   *   finds a CLOSED source when it fires opens a second one; it also survives the
+   *   element being cleaned up, and opens a stream for a detached element.
+   * - attempt: consecutive failed attempts since the last successful open. This is
+   *   what a reconnect delay function receives.
+   * - backoff: the multiplier of the default 'exponential' delay (1, 2, 4 ... 128).
+   *   Kept apart from attempt because it is not a count.
+   * - hadSource: a source was created for this element before, so descendants are
+   *   listening on an old one and must be registered again when the new one opens.
+   *
+   * Like sseSources, it lives outside the element's internal data because htmx
+   * wipes that data every time it processes the element again.
+   *
+   * @type {WeakMap<HTMLElement, {timer: number|null, attempt: number, backoff: number, hadSource: boolean}>}
+   */
+  var sseStates = new WeakMap()
+
   htmx.defineExtension('sse', {
 
     /**
@@ -49,6 +70,12 @@ This extension adds support for Server Sent Events to htmx.  See /www/extensions
       // set a function in the public API for creating new EventSource objects
       if (htmx.createEventSource == undefined) {
         htmx.createEventSource = createEventSource
+      }
+
+      // Default reconnect delay. 'exponential' is the delay this extension has always
+      // used, so nothing changes unless a page asks for something else.
+      if (!htmx.config.sseReconnectDelay) {
+        htmx.config.sseReconnectDelay = 'exponential'
       }
     },
 
@@ -75,6 +102,13 @@ This extension adds support for Server Sent Events to htmx.  See /www/extensions
         // Try to create EventSources when elements are processed
         case 'htmx:afterProcessNode':
           ensureEventSourceOnElement(parent)
+          return
+
+        // Reconnect now, on request. Triggered on the element that owns the
+        // connection or on any of its descendants. A listener can cancel it, in which
+        // case htmx does not call this at all.
+        case 'htmx:sseReconnect':
+          reconnect(parent)
       }
     }
   })
@@ -85,7 +119,8 @@ This extension adds support for Server Sent Events to htmx.  See /www/extensions
 
   /**
    * createEventSource is the default method for creating new EventSource objects.
-   * it is hoisted into htmx.config.createEventSource to be overridden by the user, if needed.
+   * It is installed as htmx.createEventSource, which a page can replace with its own
+   * function before or after this extension is loaded.
    *
    * @param {string} url
    * @returns EventSource
@@ -193,10 +228,9 @@ This extension adds support for Server Sent Events to htmx.  See /www/extensions
    * If a usable EventSource already exists, then it is returned.  If not, then a new EventSource
    * is created and stored in the element's internalData.
    * @param {HTMLElement} elt
-   * @param {number} retryCount
    * @returns {EventSource | null}
    */
-  function ensureEventSourceOnElement(elt, retryCount) {
+  function ensureEventSourceOnElement(elt) {
     if (elt == null) {
       return null
     }
@@ -204,7 +238,7 @@ This extension adds support for Server Sent Events to htmx.  See /www/extensions
     // handle extension source creation attribute
     var sseURL = api.getAttributeValue(elt, 'sse-connect')
     if (sseURL) {
-      ensureEventSource(elt, sseURL, retryCount)
+      ensureEventSource(elt, sseURL)
     } else {
       // the element does not ask for a connection anymore, close the one it owned
       closeEventSource(elt, 'sourceReplaced')
@@ -222,12 +256,11 @@ This extension adds support for Server Sent Events to htmx.  See /www/extensions
    *
    * @param {HTMLElement} elt
    * @param {string} url
-   * @param {number} retryCount
    */
-  function ensureEventSource(elt, url, retryCount) {
+  function ensureEventSource(elt, url) {
     var closeAttribute = api.getAttributeValue(elt, 'sse-close')
     var previous = sseSources.get(elt)
-    var replacedSource = false
+    var state = getState(elt)
 
     if (previous) {
       if (previous.source.readyState !== EventSource.CLOSED) {
@@ -240,44 +273,65 @@ This extension adds support for Server Sent Events to htmx.  See /www/extensions
         // The element asks for a different connection now, close the previous one
         closeEventSource(elt, 'sourceReplaced')
       }
-
-      // Descendants are still listening on the source that is being replaced
-      replacedSource = true
     }
+
+    // A fresh source makes a reconnect that is still pending pointless. Left alone it
+    // would only find this source in use and return, since a failure of this source
+    // schedules its own reconnect and replaces the pending one; clearing it is tidiness.
+    clearReconnect(state)
+
+    // Descendants are still listening on the source that is being replaced
+    var replacedSource = state.hadSource
+    state.hadSource = true
 
     var source = htmx.createEventSource(url)
 
     source.onerror = function(err) {
-      // Log an error event
-      api.triggerErrorEvent(elt, 'htmx:sseError', { error: err, source })
+      state.attempt++
+      var failure = describeFailure(source, err)
+
+      // Log an error event. A listener can cancel it to stop reconnecting.
+      var proceed = api.triggerEvent(elt, 'htmx:sseError', {
+        error: err,
+        source,
+        failure,
+        attempt: state.attempt
+      })
 
       // If parent no longer exists in the document, then clean up this EventSource
       if (maybeCloseSSESource(elt)) {
         return
       }
 
-      // Otherwise, try to reconnect the EventSource
+      if (!proceed) {
+        // Stopped until the element is processed again or htmx:sseReconnect is
+        // triggered. A source that is CONNECTING is closed too, which ends the
+        // reconnecting the browser does by itself after a network error.
+        closeEventSource(elt, 'stopped')
+        return
+      }
+
+      // Otherwise, try to reconnect the EventSource. A source that is CONNECTING is
+      // being reconnected by the browser itself, which the specification requires
+      // after a network error; only a CLOSED one is ours to reopen.
       if (source.readyState === EventSource.CLOSED) {
-        retryCount = retryCount || 0
-        retryCount = Math.max(Math.min(retryCount * 2, 128), 1)
-        var timeout = retryCount * 500
-        window.setTimeout(function() {
-          ensureEventSourceOnElement(elt, retryCount)
-        }, timeout)
+        scheduleReconnect(elt, state, failure)
       }
     }
 
     source.onopen = function(evt) {
+      // We want to increase the reconnection delay for consecutive failed attempts only
+      state.attempt = 0
+      state.backoff = 0
+
       api.triggerEvent(elt, 'htmx:sseOpen', { source })
 
-      if (replacedSource || (retryCount && retryCount > 0)) {
+      if (replacedSource) {
         const childrenToFix = elt.querySelectorAll("[sse-swap], [data-sse-swap], [hx-trigger], [data-hx-trigger]")
         for (let i = 0; i < childrenToFix.length; i++) {
           registerSSE(childrenToFix[i])
         }
         replacedSource = false
-        // We want to increase the reconnection delay for consecutive failed attempts only
-        retryCount = 0
       }
     }
 
@@ -359,6 +413,12 @@ This extension adds support for Server Sent Events to htmx.  See /www/extensions
    * @returns boolean whether a source was closed
    */
   function closeEventSource(elt, type) {
+    // A reconnect that is still pending belongs to the source being closed
+    var state = sseStates.get(elt)
+    if (state) {
+      clearReconnect(state)
+    }
+
     var internalData = api.getInternalData(elt)
     var tracked = sseSources.get(elt)
     var source = internalData.sseEventSource || (tracked && tracked.source)
@@ -394,5 +454,132 @@ This extension adds support for Server Sent Events to htmx.  See /www/extensions
 
   function hasEventSource(node) {
     return api.getInternalData(node).sseEventSource != null
+  }
+
+  /**
+   * @param {HTMLElement} elt
+   */
+  function getState(elt) {
+    var state = sseStates.get(elt)
+    if (!state) {
+      state = { timer: null, attempt: 0, backoff: 0, hadSource: false }
+      sseStates.set(elt, state)
+    }
+    return state
+  }
+
+  function clearReconnect(state) {
+    if (state.timer !== null) {
+      window.clearTimeout(state.timer)
+      state.timer = null
+    }
+  }
+
+  /**
+   * describeFailure says why a connection failed, as far as the source can tell.
+   *
+   * A native EventSource tells nothing: the specification hands the error event no
+   * status and no headers. What its readyState still tells apart is the two cases
+   * the specification treats differently: CLOSED means the server answered with
+   * something other than a 200 text/event-stream response (it "failed the
+   * connection"), CONNECTING means the connection was lost and the browser is
+   * reconnecting by itself. A transport that knows more puts its own description on
+   * the error event as `failure`, which is then passed on as it is.
+   *
+   * @param {EventSource} source
+   * @param {any} err
+   * @returns {{kind: string, status: number|null}}
+   */
+  function describeFailure(source, err) {
+    if (err && typeof err === 'object' && err.failure) {
+      return err.failure
+    }
+    if (source.readyState === EventSource.CLOSED) {
+      return { kind: 'refused', status: null }
+    }
+    return { kind: 'network', status: null }
+  }
+
+  /**
+   * reconnect opens a new connection for the element that owns the connection of
+   * the given element, now, starting the delays over. It works the same whether the
+   * connection is open, waiting for a reconnect, or stopped.
+   *
+   * @param {HTMLElement} elt
+   */
+  function reconnect(elt) {
+    var owner = api.getClosestMatch(elt, function(node) {
+      return !!api.getAttributeValue(node, 'sse-connect')
+    })
+    if (!owner) {
+      return
+    }
+
+    var state = getState(owner)
+    state.attempt = 0
+    state.backoff = 0
+    closeEventSource(owner, 'reconnect')
+    ensureEventSourceOnElement(owner)
+  }
+
+  /**
+   * scheduleReconnect reopens the element's connection after the delay chosen by
+   * htmx.config.sseReconnectDelay.
+   *
+   * @param {HTMLElement} elt
+   * @param {object} state
+   * @param {{kind: string, status: number|null}} failure
+   */
+  function scheduleReconnect(elt, state, failure) {
+    clearReconnect(state)
+    state.timer = window.setTimeout(function() {
+      state.timer = null
+      if (!api.bodyContains(elt)) {
+        closeEventSource(elt, 'nodeMissing')
+        return
+      }
+      ensureEventSourceOnElement(elt)
+    }, getReconnectDelay(state, failure))
+  }
+
+  /**
+   * getReconnectDelay returns the delay before the next attempt, in milliseconds.
+   *
+   * htmx.config.sseReconnectDelay is one of:
+   *
+   * - 'exponential' (the default): 500ms, doubling up to 64s, the same for everyone.
+   * - 'full-jitter': a random delay between 0 and that same exponential ceiling, so
+   *   that clients that lost the connection at the same moment do not all come back
+   *   at the same moment.
+   * - a function(attempt, failure) returning the delay in milliseconds, where attempt
+   *   is the number of consecutive failed attempts (1 for the first) and failure is
+   *   what is known about the last one (see htmx:sseError).
+   *
+   * @param {object} state
+   * @param {{kind: string, status: number|null}} failure
+   * @returns {number}
+   */
+  function getReconnectDelay(state, failure) {
+    var delay = htmx.config.sseReconnectDelay
+    if (typeof delay === 'function') {
+      var ms = delay(state.attempt, failure)
+      if (typeof ms === 'number' && ms >= 0) {
+        return ms
+      }
+      logError('htmx.config.sseReconnectDelay returned ' + ms + ', which is not a delay; using the default')
+    } else if (delay === 'full-jitter') {
+      return Math.random() * 500 * Math.pow(2, Math.min(state.attempt - 1, 7))
+    } else if (delay !== 'exponential' && delay != null) {
+      logError('htmx.config.sseReconnectDelay must be "exponential", "full-jitter" or a function; using the default')
+    }
+
+    state.backoff = Math.max(Math.min(state.backoff * 2, 128), 1)
+    return state.backoff * 500
+  }
+
+  function logError(msg) {
+    if (console.error) {
+      console.error(msg)
+    }
   }
 })()
